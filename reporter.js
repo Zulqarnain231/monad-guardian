@@ -1,25 +1,22 @@
 const axios = require("axios");
 
-// Discord webhook
-async function sendDiscordAlert(message){
-    try{
-        await axios.post(process.env.DISCORD_WEBHOOK_URL, { content: message });
-    } catch(e){
-        console.error("Discord error:", e.message);
+let lastSent = 0;
+
+async function sendAlert(insight) {
+    const now = Date.now();
+    if (now - lastSent < 20000) return; // 20 sec cooldown
+
+    const message = {
+        content: `🚨 Monad Guardian Alert\n\n${JSON.stringify(insight, null, 2)}`
+    };
+
+    try {
+        await axios.post(process.env.DISCORD_WEBHOOK_URL, message);
+        lastSent = now;
+        console.log("Alert sent:", insight.type);
+    } catch (err) {
+        console.error("Discord error:", err.message);
     }
 }
 
-// Moltbook posting
-async function postToMoltbook(message){
-    try{
-        await axios.post(
-            "https://moltbook.com/api/posts",
-            { title: "Monad Guardian Alert", body: message },
-            { headers: { Authorization: `Bearer ${process.env.MOLTBOOK_AGENT_TOKEN}` } }
-        );
-    } catch(e){
-        console.error("Moltbook error:", e.message);
-    }
-}
-
-module.exports = { sendDiscordAlert, postToMoltbook };
+module.exports = { sendAlert };
