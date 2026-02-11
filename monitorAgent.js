@@ -1,73 +1,69 @@
+cat <<'EOF' > monitorAgent.js
 const { ethers } = require("ethers");
 const fs = require("fs");
-const pLimit = require("p-limit"); // <<< add this
+const axios = require("axios");
+require("dotenv").config();
 
-const provider = new ethers.JsonRpcProvider(process.env.MONAD_RPC_URL); // HTTP provider
+const provider = new ethers.JsonRpcProvider(process.env.MONAD_RPC_URL || "https://rpc-devnet.monad.xyz/");
 const INSIGHTS_FILE = "insights.json";
-const limit = pLimit(5); // max 5 concurrent requests
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 
-function saveInsight(insight) {
-    let insights = [];
-    try { insights = JSON.parse(fs.readFileSync(INSIGHTS_FILE)); } catch(e) {}
-    insights.push(insight);
-    fs.writeFileSync(INSIGHTS_FILE, JSON.stringify(insights, null, 2));
-    console.log("✅ Saved insight:", insight.type, insight.hash || insight.address, insight.reason || "");
-}
+const getNYTime = () => {
+    return new Date().toLocaleString("en-US", {
+        timeZone: "America/New_York",
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+    });
+};
 
-async function analyzeTx(tx) {
-    if (!tx) return null;
-    try {
-        const receipt = await provider.getTransactionReceipt(tx.hash);
-        if (!receipt) return null;
-
-        if (receipt.status === 0) {
-            return {
-                type: "tx",
-                hash: tx.hash,
-                from: tx.from,
-                to: tx.to,
-                value: tx.value.toString(),
-                blockNumber: receipt.blockNumber,
-                reason: "Transaction failed",
-                timestamp: Date.now()
-            };
-        }
-
-        return null;
-    } catch(e) {
-        console.error("Tx analysis error:", e.message);
-        return null;
+async function sendDiscordAlert(msg) {
+    if (DISCORD_WEBHOOK && DISCORD_WEBHOOK.startsWith('http')) {
+        try { await axios.post(DISCORD_WEBHOOK, { content: msg }); } catch (e) {}
     }
 }
 
+function saveInsight(insight) {
+    let insights = [];
+    try { insights = JSON.parse(fs.readFileSync(INSIGHTS_FILE)); } catch (e) { insights = []; }
+    insights.push(insight);
+    fs.writeFileSync(INSIGHTS_FILE, JSON.stringify(insights, null, 2));
+    console.log(`✅ [Insight Saved]: ${insight.reason} | Hash: ${insight.hash.slice(0,10)}...`);
+}
+
 async function startMonitorAgent() {
-    console.log("🚀 Monitor Agent running...");
+    console.log("------------------------------------------");
+    console.log(`🚀 ScoutNet: Failed Transaction Monitor Active!`);
+    console.log("------------------------------------------");
 
-    let lastBlock = await provider.getBlockNumber();
-
-    setInterval(async () => {
+    provider.on("block", async (blockNumber) => {
+        const time = getNYTime();
         try {
-            const currentBlock = await provider.getBlockNumber();
-            for (let b = lastBlock + 1; b <= currentBlock; b++) {
-                const block = await provider.getBlock(b);
+            const block = await provider.getBlock(blockNumber, true);
+            if (!block || !block.transactions) return;
 
-                // <<< throttled transactions loop
-                const promises = block.transactions.map(txHash =>
-                    limit(async () => {
-                        const tx = await provider.getTransaction(txHash);
-                        const insight = await analyzeTx(tx);
-                        if (insight) saveInsight(insight);
-                    })
-                );
-                await Promise.all(promises); // wait for all txs in the block
+            console.log(`[${time} EST] 📦 Block ${blockNumber}: Scanning ${block.transactions.length} txs...`);
 
-                console.log("📦 Processed Block:", b);
+            for (const tx of block.transactions) {
+                const txHash = typeof tx === 'string' ? tx : tx.hash;
+                const receipt = await provider.getTransactionReceipt(txHash);
+                
+                if (receipt && receipt.status === 0) {
+                    const insight = {
+                        type: "tx_fail",
+                        hash: receipt.hash,
+                        blockNumber: blockNumber,
+                        reason: "Critical: Transaction Failed on Monad",
+                        timestamp: time
+                    };
+                    
+                    saveInsight(insight);
+                    await sendDiscordAlert(`🚨 **Failed Transaction Alert**\n**Block:** ${blockNumber}\n**Hash:** ${receipt.hash}\n**Time:** ${time} EST`);
+                }
             }
-            lastBlock = currentBlock;
-        } catch(e) {
-            console.error("Block fetch error:", e.message);
+        } catch (e) {
+            console.error("Error scanning block:", e.message);
         }
-    }, 5000); // 5 sec poll
+    });
 }
 
 module.exports = { startMonitorAgent };
+EOF
