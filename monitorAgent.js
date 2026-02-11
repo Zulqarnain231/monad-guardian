@@ -30,7 +30,23 @@ async function sendDiscordAlert(msg, level = "INFO") {
     
     try { await axios.post(DISCORD_WEBHOOK, { content }); } catch (e) {}
 }
-
+// Token Info nikalne ke liye function
+async function getTokenInfo(address, provider) {
+    try {
+        const abi = [
+            "function name() view returns (string)",
+            "function symbol() view returns (string)"
+        ];
+        const contract = new ethers.Contract(address, abi, provider);
+        const [name, symbol] = await Promise.all([
+            contract.name(),
+            contract.symbol()
+        ]);
+        return `${name} (${symbol})`;
+    } catch (e) {
+        return "Unknown Token"; // Agar contract standard ERC20 nahi hai
+    }
+}
 async function analyzeSecurity(contractAddress, provider) {
     try {
         const code = await provider.getCode(contractAddress);
