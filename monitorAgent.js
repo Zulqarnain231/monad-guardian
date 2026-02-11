@@ -1,8 +1,13 @@
 const { ethers } = require("ethers");
 const fs = require("fs");
 
+// HTTP provider (mandatory)
 const provider = new ethers.JsonRpcProvider(process.env.MONAD_RPC_URL);
-const WS_PROVIDER = process.env.MONAD_WS_URL ? new ethers.WebSocketProvider(process.env.MONAD_WS_URL) : null;
+
+// Optional WebSocket provider for real-time subscriptions
+const WS_PROVIDER = process.env.MONAD_WS_URL
+    ? new ethers.WebSocketProvider(process.env.MONAD_WS_URL)
+    : null;
 
 // File to store raw insights
 const INSIGHTS_FILE = "insights.json";
@@ -19,6 +24,7 @@ function saveInsight(insight) {
 
 // Monitor pending & failed transactions
 async function watchTransactions(tx) {
+    if (!tx) return;
     const insight = {
         type: "tx",
         hash: tx.hash,
@@ -32,7 +38,8 @@ async function watchTransactions(tx) {
 
 // Monitor new contracts
 async function watchContracts(tx) {
-    if(tx.to === null) { // Contract deployment
+    if (!tx) return;
+    if (tx.to === null) { // Contract deployment
         const contractInsight = {
             type: "contract",
             address: tx.creates || tx.contractAddress,
@@ -47,23 +54,38 @@ async function watchContracts(tx) {
 function startMonitorAgent() {
     console.log("Monitor Agent started...");
 
-    // Pending txs via WebSocket if available
-    if(WS_PROVIDER) {
+    if (WS_PROVIDER) {
+        // Listen to pending transactions
         WS_PROVIDER.on("pending", async (txHash) => {
-            const tx = await provider.getTransaction(txHash);
-            if(tx) watchTransactions(tx);
-        });
-
-        WS_PROVIDER.on("block", async (blockNumber) => {
-            const block = await provider.getBlockWithTransactions(blockNumber);
-            for(const tx of block.transactions){
-                watchContracts(tx);
+            try {
+                const tx = await provider.getTransaction(txHash); // fetch tx via HTTP provider
+                if(tx) watchTransactions(tx);
+            } catch(e) {
+                console.error("Error fetching pending tx:", e.message);
             }
         });
-    } else { // fallback HTTP polling
+
+        // Listen to new blocks
+        WS_PROVIDER.on("block", async (blockNumber) => {
+            try {
+                // ethers v6 fix: getBlock with transactions
+                const block = await provider.getBlock(Number(blockNumber), { includeTransactions: true });
+                for(const tx of block.transactions){
+                    watchContracts(tx);
+                }
+            } catch(e){
+                console.error("Error fetching block:", e.message);
+            }
+        });
+
+    } else { // fallback: only pending txs via HTTP polling
         provider.on("pending", async (txHash) => {
-            const tx = await provider.getTransaction(txHash);
-            if(tx) watchTransactions(tx);
+            try {
+                const tx = await provider.getTransaction(txHash);
+                if(tx) watchTransactions(tx);
+            } catch(e){
+                console.error("Error fetching pending tx:", e.message);
+            }
         });
     }
 }
