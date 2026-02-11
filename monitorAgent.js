@@ -1,10 +1,11 @@
 const { ethers } = require("ethers");
 const fs = require("fs");
+const pLimit = require("p-limit"); // <<< add this
 
-const provider = new ethers.WebSocketProvider(process.env.MONAD_WS_URL); // WebSocket is required
+const provider = new ethers.JsonRpcProvider(process.env.MONAD_RPC_URL); // HTTP provider
 const INSIGHTS_FILE = "insights.json";
+const limit = pLimit(5); // max 5 concurrent requests
 
-// Save insight to JSON
 function saveInsight(insight) {
     let insights = [];
     try { insights = JSON.parse(fs.readFileSync(INSIGHTS_FILE)); } catch(e) {}
@@ -13,14 +14,12 @@ function saveInsight(insight) {
     console.log("✅ Saved insight:", insight.type, insight.hash || insight.address, insight.reason || "");
 }
 
-// Check if tx is failed / abnormal
 async function analyzeTx(tx) {
     if (!tx) return null;
     try {
         const receipt = await provider.getTransactionReceipt(tx.hash);
         if (!receipt) return null;
 
-        // Failed tx
         if (receipt.status === 0) {
             return {
                 type: "tx",
@@ -34,21 +33,6 @@ async function analyzeTx(tx) {
             };
         }
 
-        // Add honeypot or abnormal checks here
-        // Example: high gas
-        if (tx.gasPrice && tx.gasPrice.gt(ethers.parseUnits("500", "gwei"))) {
-            return {
-                type: "tx",
-                hash: tx.hash,
-                from: tx.from,
-                to: tx.to,
-                value: tx.value.toString(),
-                blockNumber: receipt.blockNumber,
-                reason: "High gas detected",
-                timestamp: Date.now()
-            };
-        }
-
         return null;
     } catch(e) {
         console.error("Tx analysis error:", e.message);
@@ -56,23 +40,34 @@ async function analyzeTx(tx) {
     }
 }
 
-// Monitor new blocks
 async function startMonitorAgent() {
     console.log("🚀 Monitor Agent running...");
 
-    provider.on("block", async (blockNumber) => {
-        console.log("📦 New Block:", blockNumber);
+    let lastBlock = await provider.getBlockNumber();
 
+    setInterval(async () => {
         try {
-            const block = await provider.getBlockWithTransactions(blockNumber);
-            for (const tx of block.transactions) {
-                const insight = await analyzeTx(tx);
-                if (insight) saveInsight(insight);
+            const currentBlock = await provider.getBlockNumber();
+            for (let b = lastBlock + 1; b <= currentBlock; b++) {
+                const block = await provider.getBlock(b);
+
+                // <<< throttled transactions loop
+                const promises = block.transactions.map(txHash =>
+                    limit(async () => {
+                        const tx = await provider.getTransaction(txHash);
+                        const insight = await analyzeTx(tx);
+                        if (insight) saveInsight(insight);
+                    })
+                );
+                await Promise.all(promises); // wait for all txs in the block
+
+                console.log("📦 Processed Block:", b);
             }
+            lastBlock = currentBlock;
         } catch(e) {
             console.error("Block fetch error:", e.message);
         }
-    });
+    }, 5000); // 5 sec poll
 }
 
 module.exports = { startMonitorAgent };
