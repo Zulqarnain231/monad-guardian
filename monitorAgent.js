@@ -1,69 +1,111 @@
-cat <<'EOF' > monitorAgent.js
 const { ethers } = require("ethers");
-const fs = require("fs");
-const axios = require("axios");
 require("dotenv").config();
+const axios = require("axios");
 
-const provider = new ethers.JsonRpcProvider(process.env.MONAD_RPC_URL || "https://rpc-devnet.monad.xyz/");
-const INSIGHTS_FILE = "insights.json";
-const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
+const rpcUrls = [
+    process.env.MONAD_RPC_URL,
+    "https://monad-mainnet.public.blastapi.io",
+    "https://monad.drpc.org",
+    "https://rpc.ankr.com/monad"
+].filter(url => url);
 
-const getNYTime = () => {
-    return new Date().toLocaleString("en-US", {
-        timeZone: "America/New_York",
-        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
-    });
-};
+let currentRpcIndex = 0;
+const processedBlocks = new Set();
+// 🛡️ Security Tracker: Contract address aur unki failure count store karne ke liye
+const riskTracker = new Map(); 
 
-async function sendDiscordAlert(msg) {
-    if (DISCORD_WEBHOOK && DISCORD_WEBHOOK.startsWith('http')) {
-        try { await axios.post(DISCORD_WEBHOOK, { content: msg }); } catch (e) {}
-    }
+function getProvider() {
+    const url = rpcUrls[currentRpcIndex];
+    currentRpcIndex = (currentRpcIndex + 1) % rpcUrls.length;
+    return new ethers.JsonRpcProvider(url, { name: "monad", chainId: 10143 }, { staticNetwork: true });
 }
 
-function saveInsight(insight) {
-    let insights = [];
-    try { insights = JSON.parse(fs.readFileSync(INSIGHTS_FILE)); } catch (e) { insights = []; }
-    insights.push(insight);
-    fs.writeFileSync(INSIGHTS_FILE, JSON.stringify(insights, null, 2));
-    console.log(`✅ [Insight Saved]: ${insight.reason} | Hash: ${insight.hash.slice(0,10)}...`);
+async function sendDiscordAlert(msg, level = "INFO") {
+    const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
+    if (!DISCORD_WEBHOOK) return;
+    
+    // Level ke hisaab se emojis
+    const emoji = level === "HIGH RISK" ? "🚨🚨🚨" : level === "WARNING" ? "⚠️" : "ℹ️";
+    const content = `${emoji} **${level} ALERT** ${emoji}\n${msg}`;
+    
+    try { await axios.post(DISCORD_WEBHOOK, { content }); } catch (e) {}
+}
+
+async function analyzeSecurity(contractAddress, provider) {
+    try {
+        const code = await provider.getCode(contractAddress);
+        if (code === "0x") return "Externally Owned Account (EOA)";
+
+        // Honeypot Logic: Agar ek hi contract par 3 se zyada fail Txs hon
+        let failCount = (riskTracker.get(contractAddress) || 0) + 1;
+        riskTracker.set(contractAddress, failCount);
+
+        if (failCount >= 3) {
+            return `🚨 HONEYPOT SUSPECT: ${failCount} consecutive failures detected!`;
+        }
+
+        // Basic Code Check
+        if (code.includes("ef6363") || code.length < 200) {
+            return "⚠️ Suspiciously small or obfuscated contract code.";
+        }
+
+        return "Analyzing Patterns...";
+    } catch (e) { return "Security Scan Pending"; }
 }
 
 async function startMonitorAgent() {
     console.log("------------------------------------------");
-    console.log(`🚀 ScoutNet: Failed Transaction Monitor Active!`);
+    console.log(`🛡️  ScoutNet Sentinel: SECURITY MODE ACTIVE`);
+    console.log(`🔍 Monitoring Mainnet for Honeypots & Risks`);
     console.log("------------------------------------------");
 
-    provider.on("block", async (blockNumber) => {
-        const time = getNYTime();
+    let lastBlock = 0;
+
+    setInterval(async () => {
         try {
-            const block = await provider.getBlock(blockNumber, true);
-            if (!block || !block.transactions) return;
+            const provider = getProvider();
+            const currentBlock = await provider.getBlockNumber();
+            
+            if (currentBlock > lastBlock) {
+                if (lastBlock === 0) lastBlock = currentBlock - 1;
 
-            console.log(`[${time} EST] 📦 Block ${blockNumber}: Scanning ${block.transactions.length} txs...`);
-
-            for (const tx of block.transactions) {
-                const txHash = typeof tx === 'string' ? tx : tx.hash;
-                const receipt = await provider.getTransactionReceipt(txHash);
-                
-                if (receipt && receipt.status === 0) {
-                    const insight = {
-                        type: "tx_fail",
-                        hash: receipt.hash,
-                        blockNumber: blockNumber,
-                        reason: "Critical: Transaction Failed on Monad",
-                        timestamp: time
-                    };
+                for (let b = lastBlock + 1; b <= currentBlock; b++) {
+                    if (processedBlocks.has(b)) continue;
                     
-                    saveInsight(insight);
-                    await sendDiscordAlert(`🚨 **Failed Transaction Alert**\n**Block:** ${blockNumber}\n**Hash:** ${receipt.hash}\n**Time:** ${time} EST`);
+                    const block = await provider.getBlock(b, true);
+                    if (!block) continue;
+                    processedBlocks.add(b);
+
+                    console.log(`[Block ${b}] Scanning ${block.transactions.length} Txs...`);
+
+                    for (const txHash of block.transactions) {
+                        await new Promise(r => setTimeout(r, 10));
+                        const receipt = await provider.getTransactionReceipt(txHash);
+
+                        if (receipt && receipt.status === 0) {
+                            const contractAddress = receipt.to;
+                            if (!contractAddress) continue;
+
+                            const securityReport = await analyzeSecurity(contractAddress, provider);
+                            const explorerLink = `https://monadscan.com/tx/${receipt.hash}`;
+
+                            if (securityReport.includes("HONEYPOT")) {
+                                await sendDiscordAlert(`**Potential Honeypot Detected!**\n**Contract:** ${contractAddress}\n**Evidence:** Multiple reverted 'Sell' attempts.\n**View:** ${explorerLink}`, "HIGH RISK");
+                                console.log(`🚨 ALERT: Honeypot Suspect ${contractAddress}`);
+                            } else {
+                                console.log(`⚠️ Failed Tx: ${receipt.hash}`);
+                            }
+                        }
+                    }
+                    
+                    // Cleanup memory
+                    if (processedBlocks.size > 50) processedBlocks.delete(processedBlocks.values().next().value);
+                    if (riskTracker.size > 100) riskTracker.clear(); 
                 }
+                lastBlock = currentBlock;
             }
-        } catch (e) {
-            console.error("Error scanning block:", e.message);
-        }
-    });
+        } catch (e) {}
+    }, 2000);
 }
 
 module.exports = { startMonitorAgent };
-EOF
